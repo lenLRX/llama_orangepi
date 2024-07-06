@@ -9,12 +9,8 @@ from pathlib import Path
 from typing import List, Literal, Optional, Tuple, TypedDict
 
 import torch
+import torch_npu
 import torch.nn.functional as F
-from fairscale.nn.model_parallel.initialize import (
-    get_model_parallel_rank,
-    initialize_model_parallel,
-    model_parallel_is_initialized,
-)
 
 from llama.model import ModelArgs, Transformer
 from llama.tokenizer import Tokenizer
@@ -81,33 +77,18 @@ class Llama:
             and loads the pre-trained model and tokenizer.
 
         """
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group("nccl")
-        if not model_parallel_is_initialized():
-            if model_parallel_size is None:
-                model_parallel_size = int(os.environ.get("WORLD_SIZE", 1))
-            initialize_model_parallel(model_parallel_size)
-
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
 
         # seed must be the same in all processes
         torch.manual_seed(seed)
-
-        if local_rank > 0:
-            sys.stdout = open(os.devnull, "w")
-
+        a = torch.zeros(16).npu()
         start_time = time.time()
         checkpoints = sorted(Path(ckpt_dir).glob("*.pth"))
-        assert len(checkpoints) > 0, f"no checkpoint files found in {ckpt_dir}"
-        assert model_parallel_size == len(
-            checkpoints
-        ), f"Loading a checkpoint for MP={len(checkpoints)} but world size is {model_parallel_size}"
-        ckpt_path = checkpoints[get_model_parallel_rank()]
-        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        ckpt_path = checkpoints[0]
+        print("start loading checkpoint")
+        checkpoint = torch.load(ckpt_path, map_location="npu")
         with open(Path(ckpt_dir) / "params.json", "r") as f:
             params = json.loads(f.read())
-
+        print("end loading checkpoint")
         model_args: ModelArgs = ModelArgs(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
@@ -115,9 +96,11 @@ class Llama:
         )
         tokenizer = Tokenizer(model_path=tokenizer_path)
         model_args.vocab_size = tokenizer.n_words
-        torch.set_default_tensor_type(torch.cuda.HalfTensor)
+        torch.set_default_tensor_type(torch.HalfTensor)
         model = Transformer(model_args)
         model.load_state_dict(checkpoint, strict=False)
+        model = model.npu()
+        del checkpoint
         print(f"Loaded in {time.time() - start_time:.2f} seconds")
 
         return Llama(model, tokenizer)
@@ -155,6 +138,7 @@ class Llama:
             If logprobs is True, token log probabilities are computed for each generated token.
 
         """
+        start_generation_time = time.time()
         params = self.model.params
         bsz = len(prompt_tokens)
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
@@ -165,15 +149,19 @@ class Llama:
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_len)
 
         pad_id = self.tokenizer.pad_id
-        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="cuda")
+        #tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long, device="npu")
+        tokens = torch.full((bsz, total_len), pad_id, dtype=torch.long).npu()
         for k, t in enumerate(prompt_tokens):
-            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="cuda")
+            tokens[k, : len(t)] = torch.tensor(t, dtype=torch.long, device="npu")
         if logprobs:
             token_logprobs = torch.zeros_like(tokens, dtype=torch.float)
 
         prev_pos = 0
-        eos_reached = torch.tensor([False] * bsz, device="cuda")
+        eos_reached = torch.tensor([False] * bsz, device="npu")
         input_text_mask = tokens != pad_id
+
+        t1_start_time = time.time()
+
         if min_prompt_len == total_len:
             logits = self.model.forward(tokens, prev_pos)
             token_logprobs = -F.cross_entropy(
@@ -182,6 +170,10 @@ class Llama:
                 reduction="none",
                 ignore_index=pad_id,
             )
+
+        last_time = time.time()
+        print(f"t1 in {last_time - t1_start_time:.2f} seconds")
+        print(f"start token pos {min_prompt_len}")
 
         for cur_pos in range(min_prompt_len, total_len):
             logits = self.model.forward(tokens[:, prev_pos:cur_pos], prev_pos)
@@ -208,6 +200,9 @@ class Llama:
                 next_token == self.tokenizer.eos_id
             )
             prev_pos = cur_pos
+            curr_time = time.time()
+            print(f"token pos {cur_pos} generate in {curr_time - last_time:.2f} seconds")
+            last_time = curr_time
             if all(eos_reached):
                 break
 
@@ -228,6 +223,7 @@ class Llama:
                 probs = probs[:eos_idx] if logprobs else None
             out_tokens.append(toks)
             out_logprobs.append(probs)
+        print(f"generated in {time.time() - start_generation_time:.2f} seconds")
         return (out_tokens, out_logprobs if logprobs else None)
 
     def text_completion(
@@ -411,6 +407,8 @@ def sample_top_p(probs, p):
         exceeds the threshold p. The distribution is renormalized based on the selected tokens.
 
     """
+    # using cpu to avoid bug
+    probs = probs.cpu()
     probs_sort, probs_idx = torch.sort(probs, dim=-1, descending=True)
     probs_sum = torch.cumsum(probs_sort, dim=-1)
     mask = probs_sum - probs_sort > p
@@ -418,4 +416,6 @@ def sample_top_p(probs, p):
     probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
     next_token = torch.multinomial(probs_sort, num_samples=1)
     next_token = torch.gather(probs_idx, -1, next_token)
+    # return to npu
+    next_token = next_token.npu()
     return next_token

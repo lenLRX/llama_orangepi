@@ -1,3 +1,18 @@
+# OrangePi 20T 推理Llama2
+
+1. 直接推理会OOM，需要额外开启约24G swap内存
+2. cann_kb_init有个问题，需要使用cann_patch文件夹中的文件替换
+3. my_test.sh中Llama权重路径需要替换成实际的路径
+4. 执行my_test.sh
+
+
+## 7B测试结果：
+
+仅仅是“能跑”
+
+![测试结果](image.png)
+
+
 # Llama 2
 
 We are unlocking the power of large language models. Llama 2 is now accessible to individuals, creators, researchers, and businesses of all sizes so that they can experiment, innovate, and scale their ideas responsibly. 
