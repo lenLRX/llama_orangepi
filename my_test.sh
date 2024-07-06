@@ -1,1 +1,1 @@
-python3 -m pdb example_text_completion.py --max_batch_size=1  --ckpt_dir=/data/llama2/7B --tokenizer_path=/data/llama2/tokenizer.model
+python3  example_text_completion.py --max_batch_size=1  --ckpt_dir=/data/llama2/7B --tokenizer_path=/data/llama2/tokenizer.model
